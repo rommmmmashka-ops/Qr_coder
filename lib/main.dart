@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
@@ -13,20 +15,212 @@ void main() {
   runApp(const MyApp());
 }
 
+/// Допоміжний клас для парольного шифрування та розшифрування даних QR-коду
+/// (потоковий шифр ChaCha20 + автентифікаційний MAC-тег для перевірки пароля).
+class QrCryptoHelper {
+  static const String prefix = 'QRCENC1:';
+  static const int _saltLength = 8;
+  static const int _tagLength = 8;
+
+  static bool isEncrypted(String data) =>
+      data.trim().toUpperCase().startsWith(prefix);
+
+  static int _rotl32(int val, int shift) =>
+      ((val << shift) & 0xFFFFFFFF) | ((val & 0xFFFFFFFF) >>> (32 - shift));
+
+  static void _quarterRound(List<int> s, int a, int b, int c, int d) {
+    s[a] = (s[a] + s[b]) & 0xFFFFFFFF;
+    s[d] = _rotl32(s[d] ^ s[a], 16);
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF;
+    s[b] = _rotl32(s[b] ^ s[c], 12);
+    s[a] = (s[a] + s[b]) & 0xFFFFFFFF;
+    s[d] = _rotl32(s[d] ^ s[a], 8);
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF;
+    s[b] = _rotl32(s[b] ^ s[c], 7);
+  }
+
+  static void _chachaPermute(List<int> state) {
+    for (int i = 0; i < 10; i++) {
+      _quarterRound(state, 0, 4, 8, 12);
+      _quarterRound(state, 1, 5, 9, 13);
+      _quarterRound(state, 2, 6, 10, 14);
+      _quarterRound(state, 3, 7, 11, 15);
+      _quarterRound(state, 0, 5, 10, 15);
+      _quarterRound(state, 1, 6, 11, 12);
+      _quarterRound(state, 2, 7, 8, 13);
+      _quarterRound(state, 3, 4, 9, 14);
+    }
+  }
+
+  static List<int> _deriveKeyState(Uint8List passwordBytes, Uint8List salt) {
+    final state = List<int>.filled(16, 0);
+    state[0] = 0x61707865;
+    state[1] = 0x3320646e;
+    state[2] = 0x79622d32;
+    state[3] = 0x6b206574;
+
+    for (int i = 0; i < salt.length; i++) {
+      state[4 + (i >> 2)] ^= salt[i] << ((i & 3) * 8);
+    }
+
+    for (int round = 0; round < 1000; round++) {
+      for (int i = 0; i < passwordBytes.length; i++) {
+        final idx = 6 + ((i + round) % 10);
+        state[idx] =
+            (state[idx] ^ (passwordBytes[i] << ((i & 3) * 8))) & 0xFFFFFFFF;
+      }
+      state[15] = (state[15] + round + passwordBytes.length) & 0xFFFFFFFF;
+      _chachaPermute(state);
+    }
+    return state;
+  }
+
+  static Uint8List _processKeystream(Uint8List input, List<int> keyState) {
+    final output = Uint8List(input.length);
+    final block = List<int>.filled(16, 0);
+    final keystreamBlock = Uint8List(64);
+
+    final totalBlocks = (input.length + 63) ~/ 64;
+    for (int b = 0; b < totalBlocks; b++) {
+      for (int i = 0; i < 16; i++) {
+        block[i] = keyState[i];
+      }
+      block[12] = (block[12] ^ b ^ 0xA5A5A5A5) & 0xFFFFFFFF;
+      _chachaPermute(block);
+
+      for (int i = 0; i < 16; i++) {
+        final word = (block[i] + keyState[i]) & 0xFFFFFFFF;
+        keystreamBlock[i * 4] = word & 0xFF;
+        keystreamBlock[i * 4 + 1] = (word >>> 8) & 0xFF;
+        keystreamBlock[i * 4 + 2] = (word >>> 16) & 0xFF;
+        keystreamBlock[i * 4 + 3] = (word >>> 24) & 0xFF;
+      }
+
+      final offset = b * 64;
+      final chunkLen = min(64, input.length - offset);
+      for (int i = 0; i < chunkLen; i++) {
+        output[offset + i] = input[offset + i] ^ keystreamBlock[i];
+      }
+    }
+    return output;
+  }
+
+  static Uint8List _computeMacTag(
+    Uint8List salt,
+    Uint8List ciphertext,
+    List<int> keyState,
+  ) {
+    final macState = List<int>.generate(
+      16,
+      (i) => (keyState[i] ^ 0x5A5A5A5A) & 0xFFFFFFFF,
+    );
+
+    void absorb(Uint8List bytes) {
+      for (int i = 0; i < bytes.length; i++) {
+        final wordIdx = (i % 12) + 4;
+        macState[wordIdx] =
+            (macState[wordIdx] ^ (bytes[i] << ((i & 3) * 8))) & 0xFFFFFFFF;
+        if ((i & 15) == 15 || i == bytes.length - 1) {
+          macState[0] = (macState[0] + i + 1) & 0xFFFFFFFF;
+          _chachaPermute(macState);
+        }
+      }
+    }
+
+    absorb(salt);
+    absorb(ciphertext);
+    _chachaPermute(macState);
+
+    final tag = Uint8List(_tagLength);
+    for (int i = 0; i < _tagLength; i++) {
+      tag[i] = (macState[i >> 2] >>> ((i & 3) * 8)) & 0xFF;
+    }
+    return tag;
+  }
+
+  /// Шифрує рядок [plainText] за допомогою пароля [password].
+  static String encrypt(String plainText, String password) {
+    final rng = Random.secure();
+    final salt = Uint8List.fromList(
+      List<int>.generate(_saltLength, (_) => rng.nextInt(256)),
+    );
+    final passwordBytes = Uint8List.fromList(utf8.encode(password));
+    final plainBytes = Uint8List.fromList(utf8.encode(plainText));
+
+    final keyState = _deriveKeyState(passwordBytes, salt);
+    final cipherBytes = _processKeystream(plainBytes, keyState);
+    final tag = _computeMacTag(salt, cipherBytes, keyState);
+
+    final combined = Uint8List(_saltLength + _tagLength + cipherBytes.length);
+    combined.setRange(0, _saltLength, salt);
+    combined.setRange(_saltLength, _saltLength + _tagLength, tag);
+    combined.setRange(_saltLength + _tagLength, combined.length, cipherBytes);
+
+    final encoded = base64UrlEncode(combined).replaceAll('=', '');
+    return '$prefix$encoded';
+  }
+
+  /// Розшифровує рядок [encryptedPayload] паролем [password].
+  /// Повертає розшифрований текст або `null`, якщо пароль невірний чи дані пошкоджені.
+  static String? decrypt(String encryptedPayload, String password) {
+    final trimmed = encryptedPayload.trim();
+    if (!isEncrypted(trimmed)) return null;
+
+    var b64 = trimmed.substring(prefix.length).trim();
+    final mod = b64.length % 4;
+    if (mod == 1) return null;
+    if (mod > 0) {
+      b64 = b64.padRight(b64.length + (4 - mod), '=');
+    }
+
+    try {
+      final combined = base64Url.decode(b64);
+      if (combined.length <= _saltLength + _tagLength) return null;
+
+      final salt = Uint8List.sublistView(combined, 0, _saltLength);
+      final actualTag = Uint8List.sublistView(
+        combined,
+        _saltLength,
+        _saltLength + _tagLength,
+      );
+      final cipherBytes = Uint8List.sublistView(
+        combined,
+        _saltLength + _tagLength,
+      );
+
+      final passwordBytes = Uint8List.fromList(utf8.encode(password));
+      final keyState = _deriveKeyState(passwordBytes, salt);
+      final expectedTag = _computeMacTag(salt, cipherBytes, keyState);
+
+      int diff = 0;
+      for (int i = 0; i < _tagLength; i++) {
+        diff |= actualTag[i] ^ expectedTag[i];
+      }
+      if (diff != 0) return null;
+
+      final plainBytes = _processKeystream(cipherBytes, keyState);
+      return utf8.decode(plainBytes);
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
 enum QrDataType {
-  text('Текст', Icons.text_fields),
-  url('URL', Icons.link),
-  contact('Контакт', Icons.person),
-  wifi('Wi-Fi', Icons.wifi),
-  geo('Геолокація', Icons.location_on);
+  text('Текст', Icons.notes_rounded, 'Звичайний текст або нотатка'),
+  url('URL', Icons.language_rounded, 'Посилання на веб-сайт'),
+  contact('Контакт', Icons.badge_outlined, 'Візитка (ім’я, телефон, email)'),
+  wifi('Wi-Fi', Icons.wifi_rounded, 'Підключення до мережі Wi-Fi'),
+  geo('Геолокація', Icons.location_on_outlined, 'Координати або місце на карті');
 
   final String label;
   final IconData icon;
-  const QrDataType(this.label, this.icon);
+  final String subtitle;
+  const QrDataType(this.label, this.icon, this.subtitle);
 }
 
 enum WifiEncryption {
-  wpa('WPA/WPA2', 'WPA'),
+  wpa('WPA / WPA2', 'WPA'),
   wep('WEP', 'WEP'),
   none('Без пароля', 'nopass');
 
@@ -37,12 +231,13 @@ enum WifiEncryption {
 
 enum CenterIconMode {
   none('Без іконки', null),
-  auto('За типом даних', null),
-  wifi('Wi-Fi', Icons.wifi),
-  link('Посилання', Icons.language),
-  person('Контакт', Icons.person),
-  location('Локація', Icons.location_on),
-  star('Зірка', Icons.star);
+  auto('Авто (за типом)', null),
+  lock('Замок', Icons.lock_rounded),
+  wifi('Wi-Fi', Icons.wifi_rounded),
+  link('Посилання', Icons.language_rounded),
+  person('Контакт', Icons.person_rounded),
+  location('Локація', Icons.location_on_rounded),
+  star('Зірка', Icons.star_rounded);
 
   final String label;
   final IconData? icon;
@@ -56,36 +251,95 @@ class QrColorOption {
 }
 
 const List<QrColorOption> kQrColorOptions = [
-  QrColorOption('Чорний', Colors.black),
-  QrColorOption('Індиго', Color(0xFF283593)),
-  QrColorOption('Синій', Color(0xFF0D47A1)),
-  QrColorOption('Зелений', Color(0xFF1B5E20)),
-  QrColorOption('Бордовий', Color(0xFF880E4F)),
-  QrColorOption('Фіолетовий', Color(0xFF4A148C)),
+  QrColorOption('Чорний', Color(0xFF111827)),
+  QrColorOption('Індиго', Color(0xFF312E81)),
+  QrColorOption('Синій', Color(0xFF0C4A6E)),
+  QrColorOption('Смарагдовий', Color(0xFF065F46)),
+  QrColorOption('Бордовий', Color(0xFF881337)),
+  QrColorOption('Фіолетовий', Color(0xFF581C87)),
 ];
 
-class MyApp extends StatelessWidget {
+class MyApp extends StatefulWidget {
   const MyApp({super.key});
+
+  @override
+  State<MyApp> createState() => _MyAppState();
+}
+
+class _MyAppState extends State<MyApp> {
+  ThemeMode _themeMode = ThemeMode.system;
+
+  void _toggleTheme() {
+    setState(() {
+      _themeMode =
+          _themeMode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+    });
+  }
+
+  ThemeData _buildTheme(Brightness brightness) {
+    final colorScheme = ColorScheme.fromSeed(
+      seedColor: const Color(0xFF4F46E5),
+      brightness: brightness,
+    );
+
+    return ThemeData(
+      useMaterial3: true,
+      colorScheme: colorScheme,
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: colorScheme.surfaceContainerLowest,
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 14,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colorScheme.outlineVariant),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colorScheme.outlineVariant),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colorScheme.primary, width: 2),
+        ),
+      ),
+      cardTheme: CardThemeData(
+        elevation: 0,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: BorderSide(color: colorScheme.outlineVariant.withAlpha(140)),
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Генератор QR-кодів',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
-        useMaterial3: true,
-        inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(),
-        ),
+      themeMode: _themeMode,
+      theme: _buildTheme(Brightness.light),
+      darkTheme: _buildTheme(Brightness.dark),
+      home: QrGeneratorPage(
+        onToggleTheme: _toggleTheme,
+        themeMode: _themeMode,
       ),
-      home: const QrGeneratorPage(),
     );
   }
 }
 
 class QrGeneratorPage extends StatefulWidget {
-  const QrGeneratorPage({super.key});
+  final VoidCallback? onToggleTheme;
+  final ThemeMode themeMode;
+
+  const QrGeneratorPage({
+    super.key,
+    this.onToggleTheme,
+    this.themeMode = ThemeMode.system,
+  });
 
   @override
   State<QrGeneratorPage> createState() => _QrGeneratorPageState();
@@ -105,19 +359,27 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
   final _wifiSsidController = TextEditingController();
   final _wifiPasswordController = TextEditingController();
   WifiEncryption _wifiEncryption = WifiEncryption.wpa;
+  bool _obscureWifiPassword = true;
 
   final _geoLatController = TextEditingController();
   final _geoLngController = TextEditingController();
   final _geoQueryController = TextEditingController();
 
+  // Налаштування шифрування QR-коду паролем
+  bool _encryptWithPassword = false;
+  final _encryptionPasswordController = TextEditingController();
+  bool _obscureEncryptionPassword = true;
+
   // Налаштування кастомізації QR-коду
-  Color _qrColor = Colors.black;
+  Color _qrColor = kQrColorOptions.first.color;
   QrDataModuleShape _dataModuleShape = QrDataModuleShape.square;
   QrEyeShape _eyeShape = QrEyeShape.square;
   CenterIconMode _centerIconMode = CenterIconMode.auto;
 
-  // Рядок даних, з якого генерується QR-код
+  // Дані згенерованого QR-коду
   String? _generatedQrData;
+  QrDataType? _generatedQrType;
+  bool _generatedQrEncrypted = false;
   bool _isSaving = false;
 
   bool get _isDesktop =>
@@ -130,7 +392,10 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
       case CenterIconMode.none:
         return null;
       case CenterIconMode.auto:
-        return _selectedType.icon;
+        if (_generatedQrEncrypted) {
+          return Icons.lock_rounded;
+        }
+        return (_generatedQrType ?? _selectedType).icon;
       default:
         return _centerIconMode.icon;
     }
@@ -148,6 +413,7 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     _geoLatController.dispose();
     _geoLngController.dispose();
     _geoQueryController.dispose();
+    _encryptionPasswordController.dispose();
     super.dispose();
   }
 
@@ -160,18 +426,63 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
   }
 
   String _unescapeSpecialChars(String input) {
-    return input
-        .replaceAll(r'\:', ':')
-        .replaceAll(r'\,', ',')
-        .replaceAll(r'\;', ';')
-        .replaceAll(r'\\', r'\');
+    return input.replaceAllMapped(
+      RegExp(r'\\([\\;,:])'),
+      (match) => match.group(1)!,
+    );
   }
 
   String? _extractTagValue(String source, String tag) {
-    final pattern = RegExp('$tag:((?:\\\\.|[^;])*)');
+    final pattern = RegExp(
+      '(?:^|(?<!\\\\);)\\s*${RegExp.escape(tag)}:((?:\\\\.|[^;])*)',
+      caseSensitive: false,
+    );
     final match = pattern.firstMatch(source);
     if (match == null) return null;
     return _unescapeSpecialChars(match.group(1) ?? '');
+  }
+
+  String? _extractVCardField(String vcard, String fieldPrefix) {
+    final lines = vcard.split(RegExp(r'\r?\n'));
+    for (final line in lines) {
+      final upper = line.toUpperCase();
+      if (upper.startsWith('$fieldPrefix:') ||
+          upper.startsWith('$fieldPrefix;')) {
+        final colonIndex = line.indexOf(':');
+        if (colonIndex != -1 && colonIndex + 1 < line.length) {
+          return line.substring(colonIndex + 1).trim();
+        }
+      }
+    }
+    return null;
+  }
+
+  void _clearCurrentInputs() {
+    setState(() {
+      switch (_selectedType) {
+        case QrDataType.text:
+          _textController.clear();
+          break;
+        case QrDataType.url:
+          _urlController.clear();
+          break;
+        case QrDataType.contact:
+          _contactNameController.clear();
+          _contactPhoneController.clear();
+          _contactEmailController.clear();
+          break;
+        case QrDataType.wifi:
+          _wifiSsidController.clear();
+          _wifiPasswordController.clear();
+          _wifiEncryption = WifiEncryption.wpa;
+          break;
+        case QrDataType.geo:
+          _geoLatController.clear();
+          _geoLngController.clear();
+          _geoQueryController.clear();
+          break;
+      }
+    });
   }
 
   /// Відкриває екран камери для сканування QR-коду (на мобільних пристроях).
@@ -184,17 +495,57 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
 
     if (scannedData == null || scannedData.isEmpty || !mounted) return;
 
-    _applyScannedData(scannedData);
-    _showScannedResultDialog(scannedData);
+    _handleIncomingQrData(scannedData);
   }
 
-  /// Розпізнає тип сканованого QR-коду та заповнює відповідні поля форми.
+  /// Обробляє вхідний рядок QR-коду: якщо він зашифрований — запитує пароль.
+  void _handleIncomingQrData(String rawData) {
+    if (QrCryptoHelper.isEncrypted(rawData)) {
+      setState(() {
+        _generatedQrData = rawData.trim();
+        _generatedQrEncrypted = true;
+      });
+      _showDecryptDialog(initialEncryptedData: rawData.trim());
+    } else {
+      _applyScannedData(rawData);
+      _showScannedResultDialog(rawData);
+    }
+  }
+
+  /// Діалогове вікно введення пароля для розшифрування QR-коду.
+  Future<void> _showDecryptDialog({String? initialEncryptedData}) async {
+    final prefilled =
+        initialEncryptedData ??
+        (_generatedQrData != null &&
+                QrCryptoHelper.isEncrypted(_generatedQrData!)
+            ? _generatedQrData!
+            : '');
+
+    final decrypted = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => _DecryptQrDialog(
+        initialEncryptedData: prefilled,
+        lockEncryptedField: initialEncryptedData != null,
+      ),
+    );
+
+    if (decrypted == null || !mounted) return;
+
+    _applyScannedData(decrypted);
+    _showScannedResultDialog(decrypted, wasDecrypted: true);
+  }
+
+  /// Розпізнає тип сканованого або розшифрованого QR-коду та заповнює відповідні поля форми.
   void _applyScannedData(String raw) {
+    final lowerRaw = raw.toLowerCase();
+
     setState(() {
       _generatedQrData = raw;
+      _generatedQrEncrypted = false;
 
-      if (raw.startsWith('WIFI:')) {
+      if (lowerRaw.startsWith('wifi:')) {
         _selectedType = QrDataType.wifi;
+        _generatedQrType = QrDataType.wifi;
         final body = raw.substring(5);
         _wifiSsidController.text = _extractTagValue(body, 'S') ?? '';
         _wifiPasswordController.text = _extractTagValue(body, 'P') ?? '';
@@ -206,42 +557,86 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
         } else {
           _wifiEncryption = WifiEncryption.wpa;
         }
-      } else if (raw.startsWith('MECARD:')) {
+      } else if (lowerRaw.startsWith('mecard:')) {
         _selectedType = QrDataType.contact;
+        _generatedQrType = QrDataType.contact;
         final body = raw.substring(7);
         _contactNameController.text = _extractTagValue(body, 'N') ?? '';
         _contactPhoneController.text = _extractTagValue(body, 'TEL') ?? '';
         _contactEmailController.text = _extractTagValue(body, 'EMAIL') ?? '';
-      } else if (raw.toLowerCase().startsWith('geo:')) {
+      } else if (lowerRaw.contains('begin:vcard')) {
+        _selectedType = QrDataType.contact;
+        _generatedQrType = QrDataType.contact;
+        _contactNameController.text =
+            _extractVCardField(raw, 'FN') ?? _extractVCardField(raw, 'N') ?? '';
+        _contactPhoneController.text = _extractVCardField(raw, 'TEL') ?? '';
+        _contactEmailController.text = _extractVCardField(raw, 'EMAIL') ?? '';
+      } else if (lowerRaw.startsWith('geo:')) {
         _selectedType = QrDataType.geo;
-        final uri = Uri.tryParse(raw);
-        if (uri != null) {
-          final coords = uri.path.split(',');
-          if (coords.length >= 2) {
-            _geoLatController.text = coords[0].trim();
-            _geoLngController.text = coords[1].trim();
+        _generatedQrType = QrDataType.geo;
+        _geoLatController.clear();
+        _geoLngController.clear();
+        _geoQueryController.clear();
+
+        final body = raw.substring(4);
+        final parts = body.split('?');
+        final coordsPart = parts.first.split(';').first;
+        final coords = coordsPart.split(',');
+        if (coords.length >= 2) {
+          final latStr = coords[0].trim();
+          final lngStr = coords[1].trim();
+          final isZeroCoords =
+              (double.tryParse(latStr) == 0 && double.tryParse(lngStr) == 0) &&
+              parts.length > 1;
+          if (!isZeroCoords) {
+            _geoLatController.text = latStr;
+            _geoLngController.text = lngStr;
           }
-          _geoQueryController.text = uri.queryParameters['q'] ?? '';
         }
-      } else if (raw.startsWith('http://') || raw.startsWith('https://')) {
+        if (parts.length > 1) {
+          final queryString = parts.sublist(1).join('?');
+          try {
+            final queryParams = Uri.splitQueryString(
+              queryString.replaceAll(' ', '+'),
+            );
+            _geoQueryController.text = queryParams['q'] ?? '';
+          } catch (_) {
+            _geoQueryController.text = queryString;
+          }
+        }
+      } else if (lowerRaw.startsWith('http://') ||
+          lowerRaw.startsWith('https://')) {
         _selectedType = QrDataType.url;
+        _generatedQrType = QrDataType.url;
         _urlController.text = raw;
       } else {
         _selectedType = QrDataType.text;
+        _generatedQrType = QrDataType.text;
         _textController.text = raw;
       }
     });
   }
 
-  void _showScannedResultDialog(String scannedData) {
+  void _showScannedResultDialog(
+    String scannedData, {
+    bool wasDecrypted = false,
+  }) {
     showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.qr_code_scanner),
-            SizedBox(width: 8),
-            Expanded(child: Text('Код скановано')),
+            Icon(
+              wasDecrypted
+                  ? Icons.verified_user_outlined
+                  : Icons.qr_code_scanner_rounded,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                wasDecrypted ? 'Код успішно розшифровано' : 'Код скановано',
+              ),
+            ),
           ],
         ),
         content: SelectableText(scannedData),
@@ -252,7 +647,7 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
               Navigator.of(dialogContext).pop();
               _showSnackBar('Скопійовано в буфер обміну');
             },
-            icon: const Icon(Icons.copy),
+            icon: const Icon(Icons.copy_rounded),
             label: const Text('Копіювати'),
           ),
           FilledButton(
@@ -282,7 +677,9 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           _showSnackBar('Введіть посилання (URL)');
           return;
         }
-        if (!rawUrl.startsWith('http://') && !rawUrl.startsWith('https://')) {
+        final lowerUrl = rawUrl.toLowerCase();
+        if (!lowerUrl.startsWith('http://') &&
+            !lowerUrl.startsWith('https://')) {
           rawUrl = 'https://$rawUrl';
         }
         data = rawUrl;
@@ -298,7 +695,6 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           return;
         }
 
-        // Формат MECARD для контактів
         final buffer = StringBuffer('MECARD:');
         if (name.isNotEmpty) {
           buffer.write('N:${_escapeSpecialChars(name)};');
@@ -322,7 +718,6 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           return;
         }
 
-        // Стандартний формат WIFI:T:WPA;S:MyNetwork;P:MyPassword;;
         final escapedSsid = _escapeSpecialChars(ssid);
         final escapedPass = _escapeSpecialChars(password);
         final authType = _wifiEncryption.qrValue;
@@ -344,9 +739,14 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           return;
         }
 
+        if (rawLat.isEmpty != rawLng.isEmpty) {
+          _showSnackBar('Вкажіть обидві координати: і широту, і довготу');
+          return;
+        }
+
         double lat = 0;
         double lng = 0;
-        if (rawLat.isNotEmpty || rawLng.isNotEmpty) {
+        if (rawLat.isNotEmpty && rawLng.isNotEmpty) {
           final parsedLat = double.tryParse(rawLat);
           final parsedLng = double.tryParse(rawLng);
           if (parsedLat == null ||
@@ -364,17 +764,57 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           lng = parsedLng;
         }
 
+        final latFormatted = rawLat.isNotEmpty ? '$lat' : '0';
+        final lngFormatted = rawLng.isNotEmpty ? '$lng' : '0';
+
         if (query.isNotEmpty) {
-          data = 'geo:$lat,$lng?q=${Uri.encodeComponent(query)}';
+          data =
+              'geo:$latFormatted,$lngFormatted?q=${Uri.encodeComponent(query)}';
         } else {
-          data = 'geo:$lat,$lng';
+          data = 'geo:$latFormatted,$lngFormatted';
         }
         break;
+    }
+
+    if (_encryptWithPassword) {
+      final encPassword = _encryptionPasswordController.text;
+      if (encPassword.isEmpty) {
+        _showSnackBar('Введіть пароль для шифрування QR-коду');
+        return;
+      }
+      data = QrCryptoHelper.encrypt(data, encPassword);
+    }
+
+    final IconData? targetIcon = _centerIconMode == CenterIconMode.none
+        ? null
+        : (_centerIconMode == CenterIconMode.auto
+              ? (_encryptWithPassword ? Icons.lock_rounded : _selectedType.icon)
+              : _centerIconMode.icon);
+
+    final errorCorrectionLevel = targetIcon != null
+        ? QrErrorCorrectLevel.H
+        : QrErrorCorrectLevel.M;
+    final validation = QrValidator.validate(
+      data: data,
+      version: QrVersions.auto,
+      errorCorrectionLevel: errorCorrectionLevel,
+    );
+    if (!validation.isValid) {
+      if (validation.status == QrValidationStatus.contentTooLong) {
+        _showSnackBar(
+          'Обсяг даних завеликий для створення QR-коду (скоротіть текст або вимкніть іконку по центру)',
+        );
+      } else {
+        _showSnackBar('Помилка генерації QR-коду: ${validation.error}');
+      }
+      return;
     }
 
     FocusScope.of(context).unfocus();
     setState(() {
       _generatedQrData = data;
+      _generatedQrType = _selectedType;
+      _generatedQrEncrypted = _encryptWithPassword;
     });
   }
 
@@ -383,6 +823,24 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     const double totalSize = 1024.0;
     const double padding = 64.0;
     const double qrSize = totalSize - padding * 2;
+
+    final centerIcon = _effectiveCenterIcon;
+    final errorCorrectionLevel = centerIcon != null
+        ? QrErrorCorrectLevel.H
+        : QrErrorCorrectLevel.M;
+
+    final validation = QrValidator.validate(
+      data: data,
+      version: QrVersions.auto,
+      errorCorrectionLevel: errorCorrectionLevel,
+    );
+    if (!validation.isValid) {
+      throw Exception(
+        validation.status == QrValidationStatus.contentTooLong
+            ? 'Дані занадто довгі для вибраного рівня корекції помилок'
+            : 'Некоректні дані для генерації QR-коду',
+      );
+    }
 
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
@@ -397,13 +855,8 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     canvas.save();
     canvas.translate(padding, padding);
 
-    final centerIcon = _effectiveCenterIcon;
-    final painter = QrPainter(
-      data: data,
-      version: QrVersions.auto,
-      errorCorrectionLevel: centerIcon != null
-          ? QrErrorCorrectLevel.H
-          : QrErrorCorrectLevel.M,
+    final painter = QrPainter.withQr(
+      qr: validation.qrCode!,
       gapless: _dataModuleShape == QrDataModuleShape.square,
       eyeStyle: QrEyeStyle(
         eyeShape: _eyeShape,
@@ -461,13 +914,20 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     }
 
     final picture = recorder.endRecording();
-    final image = await picture.toImage(totalSize.toInt(), totalSize.toInt());
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-
-    if (byteData == null) {
-      throw Exception('Не вдалося сформувати PNG-зображення');
+    try {
+      final image = await picture.toImage(totalSize.toInt(), totalSize.toInt());
+      try {
+        final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+        if (byteData == null) {
+          throw Exception('Не вдалося сформувати PNG-зображення');
+        }
+        return byteData.buffer.asUint8List();
+      } finally {
+        image.dispose();
+      }
+    } finally {
+      picture.dispose();
     }
-    return byteData.buffer.asUint8List();
   }
 
   /// Зберігає QR-код у галерею (Android / iOS).
@@ -533,13 +993,93 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     }
   }
 
+  void _copyGeneratedData() {
+    final data = _generatedQrData;
+    if (data == null) return;
+    Clipboard.setData(ClipboardData(text: data));
+    _showSnackBar('Вміст QR-коду скопійовано в буфер обміну');
+  }
+
   void _showSnackBar(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+      );
+  }
+
+  /// Допоміжний віджет випадаючого списку без зміни Key під час закриття меню.
+  Widget _buildStyledDropdown<T>({
+    required String labelText,
+    IconData? prefixIcon,
+    required T value,
+    required List<DropdownMenuItem<T>> items,
+    required ValueChanged<T?> onChanged,
+    bool isDense = false,
+  }) {
+    return InputDecorator(
+      decoration: InputDecoration(
+        labelText: labelText,
+        prefixIcon: prefixIcon != null ? Icon(prefixIcon) : null,
+        isDense: isDense,
+        contentPadding: EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: isDense ? 10 : 12,
+        ),
       ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<T>(
+          value: value,
+          isDense: true,
+          isExpanded: true,
+          items: items,
+          onChanged: onChanged,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTypeSelector(ColorScheme colorScheme) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: QrDataType.values.map((type) {
+        final isSelected = _selectedType == type;
+        return ChoiceChip(
+          showCheckmark: false,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          avatar: Icon(
+            type.icon,
+            size: 18,
+            color: isSelected
+                ? colorScheme.onPrimaryContainer
+                : colorScheme.onSurfaceVariant,
+          ),
+          label: Text(
+            type.label,
+            style: TextStyle(
+              fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+            ),
+          ),
+          selected: isSelected,
+          selectedColor: colorScheme.primaryContainer,
+          onSelected: (_) {
+            setState(() {
+              _selectedType = type;
+            });
+          },
+        );
+      }).toList(),
     );
   }
 
@@ -552,7 +1092,7 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           decoration: const InputDecoration(
             labelText: 'Введіть текст',
             hintText: 'Будь-який текст або повідомлення...',
-            prefixIcon: Icon(Icons.notes),
+            prefixIcon: Icon(Icons.notes_rounded),
           ),
         );
 
@@ -563,7 +1103,7 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           decoration: const InputDecoration(
             labelText: 'Адреса сайту (URL)',
             hintText: 'https://example.com',
-            prefixIcon: Icon(Icons.language),
+            prefixIcon: Icon(Icons.language_rounded),
           ),
         );
 
@@ -574,7 +1114,7 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
               controller: _contactNameController,
               decoration: const InputDecoration(
                 labelText: "Ім'я та прізвище",
-                prefixIcon: Icon(Icons.person_outline),
+                prefixIcon: Icon(Icons.person_outline_rounded),
               ),
             ),
             const SizedBox(height: 12),
@@ -606,16 +1146,14 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
               controller: _wifiSsidController,
               decoration: const InputDecoration(
                 labelText: 'Назва мережі (SSID)',
-                prefixIcon: Icon(Icons.wifi),
+                prefixIcon: Icon(Icons.wifi_rounded),
               ),
             ),
             const SizedBox(height: 12),
-            DropdownButtonFormField<WifiEncryption>(
-              initialValue: _wifiEncryption,
-              decoration: const InputDecoration(
-                labelText: 'Тип захисту',
-                prefixIcon: Icon(Icons.security),
-              ),
+            _buildStyledDropdown<WifiEncryption>(
+              labelText: 'Тип захисту',
+              prefixIcon: Icons.security_rounded,
+              value: _wifiEncryption,
               items: WifiEncryption.values
                   .map(
                     (enc) => DropdownMenuItem(
@@ -636,10 +1174,25 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
               const SizedBox(height: 12),
               TextField(
                 controller: _wifiPasswordController,
-                obscureText: true,
-                decoration: const InputDecoration(
+                obscureText: _obscureWifiPassword,
+                decoration: InputDecoration(
                   labelText: 'Пароль мережі',
-                  prefixIcon: Icon(Icons.lock_outline),
+                  prefixIcon: const Icon(Icons.lock_outline_rounded),
+                  suffixIcon: IconButton(
+                    onPressed: () {
+                      setState(() {
+                        _obscureWifiPassword = !_obscureWifiPassword;
+                      });
+                    },
+                    tooltip: _obscureWifiPassword
+                        ? 'Показати пароль'
+                        : 'Приховати пароль',
+                    icon: Icon(
+                      _obscureWifiPassword
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                    ),
+                  ),
                 ),
               ),
             ],
@@ -661,7 +1214,7 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
                     decoration: const InputDecoration(
                       labelText: 'Широта (Lat)',
                       hintText: '50.4501',
-                      prefixIcon: Icon(Icons.my_location),
+                      prefixIcon: Icon(Icons.my_location_rounded),
                     ),
                   ),
                 ),
@@ -696,24 +1249,181 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     }
   }
 
-  Widget _buildCustomizationPanel() {
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
+  Widget _buildEncryptionSection(ColorScheme colorScheme) {
+    return Container(
+      decoration: BoxDecoration(
+        color: _encryptWithPassword
+            ? colorScheme.primaryContainer.withAlpha(70)
+            : colorScheme.surfaceContainerLowest,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: _encryptWithPassword
+              ? colorScheme.primary.withAlpha(140)
+              : colorScheme.outlineVariant,
+        ),
       ),
+      child: Column(
+        children: [
+          SwitchListTile(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 14),
+            secondary: Icon(
+              _encryptWithPassword
+                  ? Icons.lock_rounded
+                  : Icons.lock_open_rounded,
+              color: _encryptWithPassword
+                  ? colorScheme.primary
+                  : colorScheme.onSurfaceVariant,
+            ),
+            title: const Text(
+              'Зашифрувати паролем',
+              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+            ),
+            subtitle: const Text(
+              'Вміст можна буде прочитати лише ввівши пароль у додатку',
+              style: TextStyle(fontSize: 12),
+            ),
+            value: _encryptWithPassword,
+            onChanged: (value) {
+              setState(() {
+                _encryptWithPassword = value;
+              });
+            },
+          ),
+          if (_encryptWithPassword)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 4, 14, 14),
+              child: TextField(
+                controller: _encryptionPasswordController,
+                obscureText: _obscureEncryptionPassword,
+                decoration: InputDecoration(
+                  labelText: 'Пароль для захисту QR-коду',
+                  hintText: 'Введіть надійний пароль...',
+                  prefixIcon: const Icon(Icons.key_rounded),
+                  suffixIcon: IconButton(
+                    onPressed: () {
+                      setState(() {
+                        _obscureEncryptionPassword =
+                            !_obscureEncryptionPassword;
+                      });
+                    },
+                    tooltip: _obscureEncryptionPassword
+                        ? 'Показати пароль'
+                        : 'Приховати пароль',
+                    icon: Icon(
+                      _obscureEncryptionPassword
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInputCard(ColorScheme colorScheme) {
+    return Card(
+      color: colorScheme.surfaceContainerLow,
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.tune_rounded,
+                  size: 20,
+                  color: colorScheme.primary,
+                ),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Оберіть тип даних:',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: _clearCurrentInputs,
+                  icon: const Icon(Icons.restart_alt_rounded, size: 18),
+                  label: const Text('Очистити'),
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            _buildTypeSelector(colorScheme),
+            const SizedBox(height: 8),
+            Text(
+              _selectedType.subtitle,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 16),
+            _buildInputFields(),
+            const SizedBox(height: 16),
+            _buildEncryptionSection(colorScheme),
+            const SizedBox(height: 20),
+            FilledButton.icon(
+              onPressed: _generateQrCode,
+              icon: Icon(
+                _encryptWithPassword
+                    ? Icons.enhanced_encryption_rounded
+                    : Icons.qr_code_2_rounded,
+                size: 22,
+              ),
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              label: Text(
+                _encryptWithPassword
+                    ? 'Створити зашифрований QR-код'
+                    : 'Створити QR-код',
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCustomizationPanel(ColorScheme colorScheme) {
+    return Card(
+      color: colorScheme.surfaceContainerLow,
+      clipBehavior: Clip.antiAlias,
       child: ExpansionTile(
-        leading: const Icon(Icons.palette_outlined),
+        leading: Icon(Icons.palette_outlined, color: colorScheme.primary),
         title: const Text(
           'Кастомізація QR-коду',
-          style: TextStyle(fontWeight: FontWeight.w600),
+          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
         ),
-        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        subtitle: Text(
+          'Колір, форма точок та центральна іконка',
+          style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
         children: [
           const Align(
             alignment: Alignment.centerLeft,
-            child: Text('Колір коду:'),
+            child: Text(
+              'Колір коду:',
+              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+            ),
           ),
           const SizedBox(height: 8),
           Wrap(
@@ -722,11 +1432,20 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
             children: kQrColorOptions.map((option) {
               final isSelected = _qrColor == option.color;
               return ChoiceChip(
+                showCheckmark: false,
                 label: Text(option.label),
                 selected: isSelected,
-                avatar: CircleAvatar(
-                  backgroundColor: option.color,
-                  radius: 8,
+                avatar: Container(
+                  width: 18,
+                  height: 18,
+                  decoration: BoxDecoration(
+                    color: option.color,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 1.5),
+                  ),
+                  child: isSelected
+                      ? const Icon(Icons.check, size: 11, color: Colors.white)
+                      : null,
                 ),
                 onSelected: (_) {
                   setState(() => _qrColor = option.color);
@@ -734,16 +1453,14 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
               );
             }).toList(),
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 16),
           Row(
             children: [
               Expanded(
-                child: DropdownButtonFormField<QrDataModuleShape>(
-                  initialValue: _dataModuleShape,
-                  decoration: const InputDecoration(
-                    labelText: 'Форма точок',
-                    isDense: true,
-                  ),
+                child: _buildStyledDropdown<QrDataModuleShape>(
+                  labelText: 'Форма точок',
+                  value: _dataModuleShape,
+                  isDense: true,
                   items: const [
                     DropdownMenuItem(
                       value: QrDataModuleShape.square,
@@ -763,12 +1480,10 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
               ),
               const SizedBox(width: 12),
               Expanded(
-                child: DropdownButtonFormField<QrEyeShape>(
-                  initialValue: _eyeShape,
-                  decoration: const InputDecoration(
-                    labelText: 'Форма кутів',
-                    isDense: true,
-                  ),
+                child: _buildStyledDropdown<QrEyeShape>(
+                  labelText: 'Форма кутів',
+                  value: _eyeShape,
+                  isDense: true,
                   items: const [
                     DropdownMenuItem(
                       value: QrEyeShape.square,
@@ -789,13 +1504,11 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
             ],
           ),
           const SizedBox(height: 14),
-          DropdownButtonFormField<CenterIconMode>(
-            initialValue: _centerIconMode,
-            decoration: const InputDecoration(
-              labelText: 'Іконка по центру',
-              prefixIcon: Icon(Icons.center_focus_strong_outlined),
-              isDense: true,
-            ),
+          _buildStyledDropdown<CenterIconMode>(
+            labelText: 'Іконка по центру',
+            prefixIcon: Icons.center_focus_strong_outlined,
+            value: _centerIconMode,
+            isDense: true,
             items: CenterIconMode.values
                 .map(
                   (mode) => DropdownMenuItem(
@@ -816,22 +1529,45 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
   }
 
   Widget _buildSaveActions() {
+    final isCurrentlyEncrypted =
+        _generatedQrData != null &&
+        QrCryptoHelper.isEncrypted(_generatedQrData!);
+
     if (_isDesktop) {
-      return OutlinedButton.icon(
-        onPressed: _isSaving ? null : _saveToFolder,
-        icon: _isSaving
-            ? const SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : const Icon(Icons.folder_open),
-        label: const Text('Зберегти у вибрану теку'),
+      return Wrap(
+        spacing: 10,
+        runSpacing: 8,
+        alignment: WrapAlignment.center,
+        children: [
+          FilledButton.tonalIcon(
+            onPressed: _isSaving ? null : _saveToFolder,
+            icon: _isSaving
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.folder_open_rounded),
+            label: const Text('Зберегти у вибрану теку'),
+          ),
+          OutlinedButton.icon(
+            onPressed: _copyGeneratedData,
+            icon: const Icon(Icons.copy_rounded, size: 18),
+            label: const Text('Копіювати дані'),
+          ),
+          if (isCurrentlyEncrypted)
+            OutlinedButton.icon(
+              onPressed: () =>
+                  _showDecryptDialog(initialEncryptedData: _generatedQrData),
+              icon: const Icon(Icons.lock_open_rounded, size: 18),
+              label: const Text('Розшифрувати'),
+            ),
+        ],
       );
     }
 
     return Wrap(
-      spacing: 12,
+      spacing: 10,
       runSpacing: 8,
       alignment: WrapAlignment.center,
       children: [
@@ -842,30 +1578,264 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
         ),
         OutlinedButton.icon(
           onPressed: _isSaving ? null : _saveToFolder,
-          icon: const Icon(Icons.folder_open),
+          icon: const Icon(Icons.folder_open_rounded),
           label: const Text('У теку'),
+        ),
+        if (isCurrentlyEncrypted)
+          OutlinedButton.icon(
+            onPressed: () =>
+                _showDecryptDialog(initialEncryptedData: _generatedQrData),
+            icon: const Icon(Icons.lock_open_rounded, size: 18),
+            label: const Text('Розшифрувати'),
+          ),
+        IconButton.outlined(
+          onPressed: _copyGeneratedData,
+          tooltip: 'Копіювати вміст',
+          icon: const Icon(Icons.copy_rounded, size: 18),
         ),
       ],
     );
   }
 
+  Widget _buildQrResultCard(ColorScheme colorScheme) {
+    final qrData = _generatedQrData;
+    if (qrData == null) {
+      return Card(
+        color: colorScheme.surfaceContainerLow,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.qr_code_2_rounded,
+                size: 72,
+                color: colorScheme.outlineVariant,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'QR-код ще не створено',
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Заповніть поля та натисніть «Створити QR-код»',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final centerIcon = _effectiveCenterIcon;
+    final errorCorrectionLevel = centerIcon != null
+        ? QrErrorCorrectLevel.H
+        : QrErrorCorrectLevel.M;
+    final isValidQr = QrValidator.validate(
+      data: qrData,
+      version: QrVersions.auto,
+      errorCorrectionLevel: errorCorrectionLevel,
+    ).isValid;
+    final activeType = _generatedQrType ?? _selectedType;
+
+    return Card(
+      color: colorScheme.surfaceContainerLow,
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              alignment: WrapAlignment.center,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(activeType.icon, size: 18, color: colorScheme.primary),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Тип: ${activeType.label}',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: colorScheme.primary,
+                      ),
+                    ),
+                  ],
+                ),
+                if (_generatedQrEncrypted)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: colorScheme.tertiaryContainer,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.lock_rounded,
+                          size: 14,
+                          color: colorScheme.onTertiaryContainer,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Зашифровано',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: colorScheme.onTertiaryContainer,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withAlpha(20),
+                    blurRadius: 16,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  QrImageView(
+                    data: qrData,
+                    version: QrVersions.auto,
+                    size: 220,
+                    backgroundColor: Colors.white,
+                    errorCorrectionLevel: errorCorrectionLevel,
+                    gapless: _dataModuleShape == QrDataModuleShape.square,
+                    eyeStyle: QrEyeStyle(
+                      eyeShape: _eyeShape,
+                      color: _qrColor,
+                    ),
+                    dataModuleStyle: QrDataModuleStyle(
+                      dataModuleShape: _dataModuleShape,
+                      color: _qrColor,
+                    ),
+                    errorStateBuilder: (context, error) => const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(12),
+                        child: Text(
+                          'Дані занадто довгі для відображення QR-коду (вимкніть центральну іконку або скоротіть текст)',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.red, fontSize: 12),
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (centerIcon != null && isValidQr)
+                    Container(
+                      width: 44,
+                      height: 44,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: _qrColor,
+                          width: 2,
+                        ),
+                      ),
+                      child: Icon(
+                        centerIcon,
+                        color: _qrColor,
+                        size: 26,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: colorScheme.surfaceContainerHighest.withAlpha(120),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: SelectableText(
+                qrData,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  fontFamily: 'monospace',
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            if (isValidQr) _buildSaveActions(),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final centerIcon = _effectiveCenterIcon;
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Генератор QR-кодів'),
-        centerTitle: true,
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        centerTitle: false,
+        titleSpacing: 16,
+        title: const Row(
+          children: [
+            Icon(Icons.qr_code_rounded, size: 22),
+            SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                'Генератор QR-кодів',
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: colorScheme.surface,
+        surfaceTintColor: colorScheme.surfaceTint,
         actions: [
+          IconButton(
+            onPressed: () => _showDecryptDialog(),
+            tooltip: 'Розшифрувати QR-код паролем',
+            icon: const Icon(Icons.lock_open_rounded),
+          ),
+          if (widget.onToggleTheme != null)
+            IconButton(
+              onPressed: widget.onToggleTheme,
+              tooltip: isDark ? 'Світла тема' : 'Темна тема',
+              icon: Icon(
+                isDark ? Icons.light_mode_outlined : Icons.dark_mode_outlined,
+              ),
+            ),
           if (_isMobile)
             Padding(
-              padding: const EdgeInsets.only(right: 8),
+              padding: const EdgeInsets.only(right: 4),
               child: IconButton(
                 onPressed: _openScanner,
                 tooltip: 'Сканувати QR-код',
-                icon: const Icon(Icons.qr_code_scanner),
+                icon: const Icon(Icons.qr_code_scanner_rounded),
               ),
             ),
         ],
@@ -874,139 +1844,212 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           ? FloatingActionButton.extended(
               onPressed: _openScanner,
               tooltip: 'Увімкнути камеру для сканування',
-              icon: const Icon(Icons.qr_code_scanner),
+              icon: const Icon(Icons.qr_code_scanner_rounded),
               label: const Text('Сканувати'),
             )
           : null,
       floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(20, 20, 20, 88),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 500),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text(
-                  'Оберіть тип даних:',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 10),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: QrDataType.values.map((type) {
-                    final isSelected = _selectedType == type;
-                    return ChoiceChip(
-                      showCheckmark: false,
-                      avatar: Icon(
-                        type.icon,
-                        size: 18,
-                        color: isSelected
-                            ? Theme.of(context).colorScheme.onSecondaryContainer
-                            : Theme.of(context).colorScheme.onSurfaceVariant,
-                      ),
-                      label: Text(type.label),
-                      selected: isSelected,
-                      onSelected: (_) {
-                        setState(() {
-                          _selectedType = type;
-                        });
-                      },
-                    );
-                  }).toList(),
-                ),
-                const SizedBox(height: 20),
-                _buildInputFields(),
-                const SizedBox(height: 16),
-                _buildCustomizationPanel(),
-                const SizedBox(height: 20),
-                FilledButton.icon(
-                  onPressed: _generateQrCode,
-                  icon: const Icon(Icons.qr_code_2),
-                  label: const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 12),
-                    child: Text(
-                      'Створити QR-код',
-                      style: TextStyle(fontSize: 16),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final isWide = constraints.maxWidth >= 860;
+
+            if (isWide) {
+              return Center(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(24),
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 1040),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          flex: 6,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              _buildInputCard(colorScheme),
+                              const SizedBox(height: 16),
+                              _buildCustomizationPanel(colorScheme),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 24),
+                        Expanded(
+                          flex: 5,
+                          child: _buildQrResultCard(colorScheme),
+                        ),
+                      ],
                     ),
                   ),
                 ),
-                const SizedBox(height: 28),
-                if (_generatedQrData != null)
-                  Card(
-                    elevation: 2,
-                    child: Padding(
-                      padding: const EdgeInsets.all(20),
-                      child: Column(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                QrImageView(
-                                  data: _generatedQrData!,
-                                  version: QrVersions.auto,
-                                  size: 220,
-                                  backgroundColor: Colors.white,
-                                  errorCorrectionLevel: centerIcon != null
-                                      ? QrErrorCorrectLevel.H
-                                      : QrErrorCorrectLevel.M,
-                                  gapless:
-                                      _dataModuleShape ==
-                                      QrDataModuleShape.square,
-                                  eyeStyle: QrEyeStyle(
-                                    eyeShape: _eyeShape,
-                                    color: _qrColor,
-                                  ),
-                                  dataModuleStyle: QrDataModuleStyle(
-                                    dataModuleShape: _dataModuleShape,
-                                    color: _qrColor,
-                                  ),
-                                ),
-                                if (centerIcon != null)
-                                  Container(
-                                    width: 44,
-                                    height: 44,
-                                    decoration: BoxDecoration(
-                                      color: Colors.white,
-                                      borderRadius: BorderRadius.circular(10),
-                                      border: Border.all(
-                                        color: _qrColor,
-                                        width: 2,
-                                      ),
-                                    ),
-                                    child: Icon(
-                                      centerIcon,
-                                      color: _qrColor,
-                                      size: 26,
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          SelectableText(
-                            _generatedQrData!,
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                          const SizedBox(height: 16),
-                          _buildSaveActions(),
-                        ],
-                      ),
-                    ),
+              );
+            }
+
+            return Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 520),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _buildInputCard(colorScheme),
+                      const SizedBox(height: 14),
+                      _buildCustomizationPanel(colorScheme),
+                      if (_generatedQrData != null) ...[
+                        const SizedBox(height: 20),
+                        _buildQrResultCard(colorScheme),
+                      ],
+                    ],
                   ),
-              ],
-            ),
-          ),
+                ),
+              ),
+            );
+          },
         ),
       ),
+    );
+  }
+}
+
+/// Окремий StatefulWidget для діалогу розшифрування, щоб контролери
+/// коректно звільнялися лише після повного завершення анімації закриття діалогу.
+class _DecryptQrDialog extends StatefulWidget {
+  final String initialEncryptedData;
+  final bool lockEncryptedField;
+
+  const _DecryptQrDialog({
+    required this.initialEncryptedData,
+    required this.lockEncryptedField,
+  });
+
+  @override
+  State<_DecryptQrDialog> createState() => _DecryptQrDialogState();
+}
+
+class _DecryptQrDialogState extends State<_DecryptQrDialog> {
+  late final TextEditingController _codeController;
+  final TextEditingController _passwordController = TextEditingController();
+  bool _obscurePassword = true;
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _codeController = TextEditingController(text: widget.initialEncryptedData);
+  }
+
+  @override
+  void dispose() {
+    _codeController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  void _attemptDecrypt() {
+    final encryptedText = _codeController.text.trim();
+    final password = _passwordController.text;
+
+    if (encryptedText.isEmpty) {
+      setState(() {
+        _errorMessage = 'Вставте зашифрований код (QRCENC1:...)';
+      });
+      return;
+    }
+    if (!QrCryptoHelper.isEncrypted(encryptedText)) {
+      setState(() {
+        _errorMessage =
+            'Цей код не є зашифрованим (відсутній префікс QRCENC1:)';
+      });
+      return;
+    }
+    if (password.isEmpty) {
+      setState(() {
+        _errorMessage = 'Введіть пароль для розшифрування';
+      });
+      return;
+    }
+
+    final decrypted = QrCryptoHelper.decrypt(encryptedText, password);
+    if (decrypted == null) {
+      setState(() {
+        _errorMessage = 'Невірний пароль або пошкоджений код';
+      });
+      return;
+    }
+
+    Navigator.of(context).pop(decrypted);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.lock_open_rounded),
+          SizedBox(width: 10),
+          Expanded(child: Text('Розшифрувати QR-код')),
+        ],
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text(
+              'Цей QR-код захищено паролем. Введіть пароль, щоб переглянути його вміст:',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 14),
+            if (!widget.lockEncryptedField) ...[
+              TextField(
+                controller: _codeController,
+                maxLines: 2,
+                decoration: const InputDecoration(
+                  labelText: 'Зашифрований рядок (QRCENC1:...)',
+                  prefixIcon: Icon(Icons.qr_code_rounded),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+            TextField(
+              controller: _passwordController,
+              obscureText: _obscurePassword,
+              autofocus: true,
+              onSubmitted: (_) => _attemptDecrypt(),
+              decoration: InputDecoration(
+                labelText: 'Пароль розшифрування',
+                prefixIcon: const Icon(Icons.key_rounded),
+                errorText: _errorMessage,
+                suffixIcon: IconButton(
+                  onPressed: () {
+                    setState(() {
+                      _obscurePassword = !(_obscurePassword);
+                    });
+                  },
+                  icon: Icon(
+                    _obscurePassword
+                        ? Icons.visibility_outlined
+                        : Icons.visibility_off_outlined,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Скасувати'),
+        ),
+        FilledButton.icon(
+          onPressed: _attemptDecrypt,
+          icon: const Icon(Icons.lock_open_rounded, size: 18),
+          label: const Text('Розшифрувати'),
+        ),
+      ],
     );
   }
 }
@@ -1033,7 +2076,7 @@ class _QrScannerPageState extends State<QrScannerPage> {
   }
 
   void _onDetect(BarcodeCapture capture) {
-    if (_hasScanned) return;
+    if (_hasScanned || !mounted) return;
 
     for (final barcode in capture.barcodes) {
       final rawValue = barcode.rawValue;
@@ -1051,15 +2094,34 @@ class _QrScannerPageState extends State<QrScannerPage> {
       appBar: AppBar(
         title: const Text('Сканування QR-коду'),
         actions: [
-          IconButton(
-            onPressed: () => _controller.toggleTorch(),
-            tooltip: 'Ліхтарик',
-            icon: const Icon(Icons.flash_on),
-          ),
-          IconButton(
-            onPressed: () => _controller.switchCamera(),
-            tooltip: 'Змінити камеру',
-            icon: const Icon(Icons.cameraswitch),
+          ValueListenableBuilder<MobileScannerState>(
+            valueListenable: _controller,
+            builder: (context, state, _) {
+              final isReady = state.isInitialized && state.isRunning;
+              final torchAvailable =
+                  isReady && state.torchState != TorchState.unavailable;
+              final isTorchOn = state.torchState == TorchState.on;
+
+              return Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    onPressed: torchAvailable
+                        ? () => _controller.toggleTorch()
+                        : null,
+                    tooltip: 'Ліхтарик',
+                    icon: Icon(isTorchOn ? Icons.flash_on : Icons.flash_off),
+                  ),
+                  IconButton(
+                    onPressed: isReady
+                        ? () => _controller.switchCamera()
+                        : null,
+                    tooltip: 'Змінити камеру',
+                    icon: const Icon(Icons.cameraswitch),
+                  ),
+                ],
+              );
+            },
           ),
         ],
       ),
@@ -1069,6 +2131,27 @@ class _QrScannerPageState extends State<QrScannerPage> {
           MobileScanner(
             controller: _controller,
             onDetect: _onDetect,
+            errorBuilder: (context, error) => Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.videocam_off_outlined,
+                      color: Colors.white70,
+                      size: 56,
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Не вдалося запустити камеру (${error.errorCode.name})',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Colors.white, fontSize: 16),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
           Center(
             child: Container(
@@ -1076,7 +2159,7 @@ class _QrScannerPageState extends State<QrScannerPage> {
               height: 250,
               decoration: BoxDecoration(
                 border: Border.all(color: Colors.white, width: 3),
-                borderRadius: BorderRadius.circular(16),
+                borderRadius: BorderRadius.circular(20),
               ),
             ),
           ),
