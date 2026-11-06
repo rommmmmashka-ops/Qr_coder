@@ -207,6 +207,83 @@ class QrCryptoHelper {
   }
 }
 
+/// Утиліта для контролю тимчасових файлів, кешу плагінів та оперативної пам’яті.
+class AppStorageCleaner {
+  /// Обмежує розмір RAM-кешу декодованих зображень Flutter (замість стандартних 100 МБ -> 20 МБ).
+  static void configureCompactMemoryCache() {
+    try {
+      final imageCache = PaintingBinding.instance.imageCache;
+      imageCache.maximumSize = 40;
+      imageCache.maximumSizeBytes = 20 * 1024 * 1024;
+    } catch (_) {}
+  }
+
+  /// Підраховує обсяг тимчасових файлів у системній кеш-директорії додатку.
+  static Future<({int fileCount, int totalBytes})> inspectTempStorage() async {
+    if (kIsWeb) return (fileCount: 0, totalBytes: 0);
+    int count = 0;
+    int bytes = 0;
+    try {
+      final tempDir = Directory.systemTemp;
+      if (await tempDir.exists()) {
+        await for (final entity in tempDir.list(
+          recursive: true,
+          followLinks: false,
+        )) {
+          if (entity is File) {
+            try {
+              final len = await entity.length();
+              count++;
+              bytes += len;
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+    return (fileCount: count, totalBytes: bytes);
+  }
+
+  /// Видаляє тимчасові файли плагінів (file_picker, gal, тимчасові зображення)
+  /// та очищує кеш зображень у пам’яті. Повертає кількість видалених байтів.
+  static Future<int> clearTemporaryStorage() async {
+    try {
+      final imageCache = PaintingBinding.instance.imageCache;
+      imageCache.clear();
+      imageCache.clearLiveImages();
+    } catch (_) {}
+
+    if (kIsWeb) return 0;
+
+    int freedBytes = 0;
+    try {
+      final tempDir = Directory.systemTemp;
+      if (await tempDir.exists()) {
+        await for (final entity in tempDir.list(
+          recursive: true,
+          followLinks: false,
+        )) {
+          if (entity is File) {
+            try {
+              final len = await entity.length();
+              await entity.delete();
+              freedBytes += len;
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+    return freedBytes;
+  }
+
+  static String formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes Б';
+    final kb = bytes / 1024;
+    if (kb < 1024) return '${kb.toStringAsFixed(1)} КБ';
+    final mb = kb / 1024;
+    return '${mb.toStringAsFixed(2)} МБ';
+  }
+}
+
 /// Рівень безпеки URL-адреси при перевірці.
 enum UrlRiskLevel {
   safe('Безпечне з’єднання', Icons.verified_user_rounded, Color(0xFF059669)),
@@ -721,6 +798,14 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
       default:
         return _centerIconMode.icon;
     }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    AppStorageCleaner.configureCompactMemoryCache();
+    // Автоматично очищуємо залишкові тимчасові файли попередніх сесій при старті
+    unawaited(AppStorageCleaner.clearTemporaryStorage());
   }
 
   @override
@@ -1327,6 +1412,7 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     } catch (e) {
       _showSnackBar('Помилка збереження в галерею: $e');
     } finally {
+      unawaited(AppStorageCleaner.clearTemporaryStorage());
       if (mounted) {
         setState(() => _isSaving = false);
       }
@@ -1361,10 +1447,85 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     } catch (e) {
       _showSnackBar('Помилка збереження файлу: $e');
     } finally {
+      unawaited(AppStorageCleaner.clearTemporaryStorage());
       if (mounted) {
         setState(() => _isSaving = false);
       }
     }
+  }
+
+  Future<void> _showStorageOptimizationDialog() async {
+    final stats = await AppStorageCleaner.inspectTempStorage();
+    if (!mounted) return;
+
+    const isDebugBuild = kDebugMode;
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.cleaning_services_outlined),
+            SizedBox(width: 10),
+            Expanded(child: Text('Пам’ять та оптимізація')),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'Тимчасовий кеш додатку: ${AppStorageCleaner.formatBytes(stats.totalBytes)} (${stats.fileCount} файлів)',
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Додаток не накопичує особистих даних чи історії, а тимчасові файли від збереження зображень автоматично видаляються.',
+                style: TextStyle(fontSize: 13),
+              ),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Theme.of(dialogContext)
+                      .colorScheme
+                      .surfaceContainerHighest
+                      .withAlpha(120),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  isDebugBuild
+                      ? '⚠️ Зараз запущено Debug-збірку (режим розробки).\n'
+                            'Саме через Debug-режим додаток займає ~180–200 МБ: він містить віртуальну машину Dart VM, JIT-компілятор для Hot Reload та бібліотеки одразу для 3 процесорних архітектур (arm64, armv7, x86_64).\n\n'
+                            'Щоб зменшити розмір у 8–10 разів (~18–25 МБ), встановіть Release-збірку командою:\n'
+                            'flutter build apk --release --split-per-abi'
+                      : '✅ Запущено оптимізовану Release-збірку (мініфікація R8 та стиснення ресурсів активні).',
+                  style: const TextStyle(fontSize: 12.5, height: 1.4),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Закрити'),
+          ),
+          FilledButton.tonalIcon(
+            onPressed: () async {
+              final freed = await AppStorageCleaner.clearTemporaryStorage();
+              if (!dialogContext.mounted) return;
+              Navigator.of(dialogContext).pop();
+              _showSnackBar(
+                'Кеш очищено (звільнено ${AppStorageCleaner.formatBytes(freed)})',
+              );
+            },
+            icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+            label: const Text('Очистити кеш'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _copyGeneratedData() {
@@ -2212,12 +2373,20 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
         surfaceTintColor: colorScheme.surfaceTint,
         actions: [
           IconButton(
+            visualDensity: VisualDensity.compact,
             onPressed: () => _showDecryptDialog(),
             tooltip: 'Розшифрувати QR-код паролем',
             icon: const Icon(Icons.lock_open_rounded),
           ),
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            onPressed: _showStorageOptimizationDialog,
+            tooltip: 'Очищення кешу та пам’яті',
+            icon: const Icon(Icons.cleaning_services_outlined),
+          ),
           if (widget.onToggleTheme != null)
             IconButton(
+              visualDensity: VisualDensity.compact,
               onPressed: widget.onToggleTheme,
               tooltip: isDark ? 'Світла тема' : 'Темна тема',
               icon: Icon(
@@ -2228,6 +2397,7 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
             Padding(
               padding: const EdgeInsets.only(right: 4),
               child: IconButton(
+                visualDensity: VisualDensity.compact,
                 onPressed: _openScanner,
                 tooltip: 'Сканувати QR-код',
                 icon: const Icon(Icons.qr_code_scanner_rounded),

@@ -24,13 +24,13 @@ void main() {
     final safeCheck = SafeWebInspector.evaluateUriSecurity(
       Uri.parse('https://flutter.dev/docs'),
     );
-    expect(safeCheck.riskLevel, equals(UrlRiskLevel.safe));
+    expect(safeCheck.level, equals(UrlRiskLevel.safe));
 
     final phishingCheck = SafeWebInspector.evaluateUriSecurity(
       Uri.parse('http://google.com@192.168.1.1/update.apk'),
     );
-    expect(phishingCheck.riskLevel, equals(UrlRiskLevel.danger));
-    expect(phishingCheck.warnings, isNotEmpty);
+    expect(phishingCheck.level, equals(UrlRiskLevel.danger));
+    expect(phishingCheck.notes, isNotEmpty);
 
     final parsedHtml = SafeWebInspector.parseHtmlForSafeReading(
       '<html><head><title>Тестова сторінка</title></head>'
@@ -42,14 +42,20 @@ void main() {
       Uri.parse('https://example.com/start'),
     );
     expect(parsedHtml.title, equals('Тестова сторінка'));
-    expect(parsedHtml.readableBlocks, contains('📌 Заголовок безпеки'));
-    expect(parsedHtml.readableBlocks, contains('Чистий текст без скриптів.'));
+    expect(parsedHtml.blocks, contains('## Заголовок безпеки'));
+    expect(parsedHtml.blocks, contains('Чистий текст без скриптів.'));
     expect(
-      parsedHtml.readableBlocks.join(' '),
+      parsedHtml.blocks.join(' '),
       isNot(contains('alert("xss")')),
     );
     expect(parsedHtml.links.length, equals(1));
     expect(parsedHtml.links.first.url, equals('https://example.com/about'));
+  });
+
+  test('AppStorageCleaner formats byte sizes accurately', () {
+    expect(AppStorageCleaner.formatBytes(512), equals('512 Б'));
+    expect(AppStorageCleaner.formatBytes(2048), equals('2.0 КБ'));
+    expect(AppStorageCleaner.formatBytes(1048576), equals('1.00 МБ'));
   });
 
   testWidgets('QR code generator creates QR from text and geolocation input', (
