@@ -20,6 +20,38 @@ void main() {
     expect(QrCryptoHelper.decrypt(encrypted, password), equals(secretText));
   });
 
+  test('SafeWebInspector detects risky URLs and cleans HTML safely', () {
+    final safeCheck = SafeWebInspector.evaluateUriSecurity(
+      Uri.parse('https://flutter.dev/docs'),
+    );
+    expect(safeCheck.riskLevel, equals(UrlRiskLevel.safe));
+
+    final phishingCheck = SafeWebInspector.evaluateUriSecurity(
+      Uri.parse('http://google.com@192.168.1.1/update.apk'),
+    );
+    expect(phishingCheck.riskLevel, equals(UrlRiskLevel.danger));
+    expect(phishingCheck.warnings, isNotEmpty);
+
+    final parsedHtml = SafeWebInspector.parseHtmlForSafeReading(
+      '<html><head><title>Тестова сторінка</title></head>'
+      '<body><script>alert("xss")</script>'
+      '<h1>Заголовок безпеки</h1><p>Чистий текст без скриптів.</p>'
+      '<a href="/about">Про нас</a>'
+      '<a href="javascript:evil()">Шкідливий лінк</a>'
+      '</body></html>',
+      Uri.parse('https://example.com/start'),
+    );
+    expect(parsedHtml.title, equals('Тестова сторінка'));
+    expect(parsedHtml.readableBlocks, contains('📌 Заголовок безпеки'));
+    expect(parsedHtml.readableBlocks, contains('Чистий текст без скриптів.'));
+    expect(
+      parsedHtml.readableBlocks.join(' '),
+      isNot(contains('alert("xss")')),
+    );
+    expect(parsedHtml.links.length, equals(1));
+    expect(parsedHtml.links.first.url, equals('https://example.com/about'));
+  });
+
   testWidgets('QR code generator creates QR from text and geolocation input', (
     WidgetTester tester,
   ) async {

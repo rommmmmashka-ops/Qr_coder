@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -203,6 +204,327 @@ class QrCryptoHelper {
     } catch (_) {
       return null;
     }
+  }
+}
+
+/// Рівень безпеки URL-адреси при перевірці.
+enum UrlRiskLevel {
+  safe('Безпечне з’єднання', Icons.verified_user_rounded, Color(0xFF059669)),
+  warning('Потребує уваги', Icons.warning_amber_rounded, Color(0xFFD97706)),
+  danger('Високий ризик', Icons.gpp_bad_rounded, Color(0xFFDC2626));
+
+  final String label;
+  final IconData icon;
+  final Color color;
+  const UrlRiskLevel(this.label, this.icon, this.color);
+}
+
+/// Результат евристичної перевірки безпеки посилання та очищеного вмісту сторінки.
+class SafePageAnalysis {
+  final String originalUrl;
+  final String finalUrl;
+  final List<String> redirectChain;
+  final UrlRiskLevel riskLevel;
+  final List<String> securityNotes;
+  final int? statusCode;
+  final String contentType;
+  final String pageTitle;
+  final String metaDescription;
+  final List<String> textBlocks;
+  final List<({String text, String url})> links;
+  final String rawSource;
+  final Map<String, String> responseHeaders;
+  final String? certIssuer;
+  final String? certSubject;
+  final DateTime? certValidUntil;
+
+  const SafePageAnalysis({
+    required this.originalUrl,
+    required this.finalUrl,
+    required this.redirectChain,
+    required this.riskLevel,
+    required this.securityNotes,
+    required this.statusCode,
+    required this.contentType,
+    required this.pageTitle,
+    required this.metaDescription,
+    required this.textBlocks,
+    required this.links,
+    required this.rawSource,
+    required this.responseHeaders,
+    this.certIssuer,
+    this.certSubject,
+    this.certValidUntil,
+  });
+}
+
+/// Аналізатор безпеки URL та парсер безпечного режиму читання (без виконання JS).
+class SafeWebInspector {
+  static const Set<String> _knownShorteners = {
+    'bit.ly',
+    'tinyurl.com',
+    't.co',
+    'goo.gl',
+    'ow.ly',
+    'is.gd',
+    'buff.ly',
+    'cutt.ly',
+    'rb.gy',
+    'tiny.cc',
+    'shorturl.at',
+  };
+
+  static const List<String> _dangerousExtensions = [
+    '.apk',
+    '.exe',
+    '.msi',
+    '.bat',
+    '.cmd',
+    '.scr',
+    '.vbs',
+    '.jar',
+    '.dmg',
+    '.sh',
+  ];
+
+  /// Перевіряє URI на підозрілі ознаки фішингу або небезпечної схеми.
+  static ({UrlRiskLevel level, List<String> notes}) evaluateUriSecurity(
+    Uri uri, {
+    List<String> redirectChain = const [],
+  }) {
+    final notes = <String>[];
+    var level = UrlRiskLevel.safe;
+
+    void escalate(UrlRiskLevel newLevel) {
+      if (newLevel.index > level.index) {
+        level = newLevel;
+      }
+    }
+
+    final scheme = uri.scheme.toLowerCase();
+    final host = uri.host.toLowerCase();
+
+    if (scheme != 'https') {
+      notes.add(
+        'З’єднання використовує незахищений протокол (${scheme.toUpperCase()} замість HTTPS). Дані передаються у відкритому вигляді.',
+      );
+      escalate(UrlRiskLevel.warning);
+    } else {
+      notes.add('Використовується захищений протокол шифрування HTTPS.');
+    }
+
+    if (uri.userInfo.isNotEmpty) {
+      notes.add(
+        'Адреса містить символ "@" перед доменом (${uri.userInfo}@...) — це типова ознака маскування фішингового посилання!',
+      );
+      escalate(UrlRiskLevel.danger);
+    }
+
+    final isIpAddress =
+        RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(host) || host.contains(':');
+    if (isIpAddress) {
+      notes.add(
+        'Замість доменного імені використовується пряма IP-адреса ($host).',
+      );
+      escalate(UrlRiskLevel.danger);
+    }
+
+    if (host.contains('xn--')) {
+      notes.add(
+        'Домен містить Punycode ($host) — можлива підміна схожих кириличних та латинських літер (IDN-атака).',
+      );
+      escalate(UrlRiskLevel.warning);
+    }
+
+    if (_knownShorteners.contains(host)) {
+      notes.add(
+        'Посилання веде через сервіс скорочення адрес ($host), який приховує кінцевий сайт.',
+      );
+      escalate(UrlRiskLevel.warning);
+    }
+
+    if (uri.hasPort && uri.port != 80 && uri.port != 443) {
+      notes.add('Використовується нестандартний мережевий порт: ${uri.port}.');
+      escalate(UrlRiskLevel.warning);
+    }
+
+    final lowerPath = uri.path.toLowerCase();
+    for (final ext in _dangerousExtensions) {
+      if (lowerPath.endsWith(ext)) {
+        notes.add(
+          'Посилання веде безпосередньо на виконуваний або інсталяційний файл ($ext)!',
+        );
+        escalate(UrlRiskLevel.danger);
+        break;
+      }
+    }
+
+    if (redirectChain.length > 1) {
+      notes.add(
+        'Виявлено перенаправлення (${redirectChain.length - 1} редиректів) до кінцевої адреси: $host.',
+      );
+    }
+
+    return (level: level, notes: notes);
+  }
+
+  /// Декодує базові HTML-сутності для чистого відображення тексту.
+  static String decodeHtmlEntities(String input) {
+    return input
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'")
+        .replaceAll('&apos;', "'")
+        .replaceAll('&mdash;', '—')
+        .replaceAll('&ndash;', '–')
+        .replaceAll('&laquo;', '«')
+        .replaceAll('&raquo;', '»')
+        .replaceAll('&copy;', '©')
+        .replaceAllMapped(RegExp(r'&#(\d+);'), (match) {
+          final code = int.tryParse(match.group(1) ?? '');
+          return code != null ? String.fromCharCode(code) : match.group(0)!;
+        })
+        .replaceAllMapped(RegExp(r'&#x([0-9a-fA-F]+);'), (match) {
+          final code = int.tryParse(match.group(1) ?? '', radix: 16);
+          return code != null ? String.fromCharCode(code) : match.group(0)!;
+        });
+  }
+
+  static String _stripTags(String htmlFragment) {
+    final withoutTags = htmlFragment.replaceAll(RegExp(r'<[^>]*>'), ' ');
+    return decodeHtmlEntities(
+      withoutTags,
+    ).replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  /// Витягує безпечний для читання вміст із сирого HTML-коду (без скриптів і стилів).
+  static ({
+    String title,
+    String description,
+    List<String> blocks,
+    List<({String text, String url})> links,
+  })
+  parseHtmlForSafeReading(String html, Uri baseUri) {
+    // 1. Видаляємо потенційно небезпечні та технічні блоки: script, style, svg, noscript, iframe
+    final sanitized = html.replaceAll(
+      RegExp(
+        r'<(script|style|noscript|svg|iframe|object|embed|head\s*>)[\s\S]*?<\/\1>',
+        caseSensitive: false,
+      ),
+      ' ',
+    );
+
+    // 2. Витягуємо <title>
+    String title = '';
+    final titleMatch = RegExp(
+      r'<title[^>]*>([\s\S]*?)<\/title>',
+      caseSensitive: false,
+    ).firstMatch(html);
+    if (titleMatch != null) {
+      title = _stripTags(titleMatch.group(1) ?? '');
+    }
+
+    // 3. Витягуємо <meta name="description" content="...">
+    String description = '';
+    final metaMatches = RegExp(
+      r'<meta\s+[^>]*>',
+      caseSensitive: false,
+    ).allMatches(html);
+    for (final m in metaMatches) {
+      final tag = m.group(0) ?? '';
+      final isDesc = RegExp(
+        r'''(name|property)\s*=\s*["'](description|og:description)["']''',
+        caseSensitive: false,
+      ).hasMatch(tag);
+      if (isDesc) {
+        final contentMatch = RegExp(
+          r'''content\s*=\s*["']([^"']*)["']''',
+          caseSensitive: false,
+        ).firstMatch(tag);
+        if (contentMatch != null) {
+          description = decodeHtmlEntities(
+            contentMatch.group(1) ?? '',
+          ).trim();
+          if (description.isNotEmpty) break;
+        }
+      }
+    }
+
+    // 4. Витягуємо заголовки (h1-h3), абзаци (p), елементи списку (li)
+    final blocks = <String>[];
+    final blockRegex = RegExp(
+      r'<(h1|h2|h3|p|li|blockquote)[^>]*>([\s\S]*?)<\/\1>',
+      caseSensitive: false,
+    );
+    for (final match in blockRegex.allMatches(sanitized)) {
+      final tagName = (match.group(1) ?? '').toLowerCase();
+      final text = _stripTags(match.group(2) ?? '');
+      if (text.length < 2) continue;
+
+      if (tagName.startsWith('h')) {
+        blocks.add('## $text');
+      } else if (tagName == 'li') {
+        blocks.add('• $text');
+      } else {
+        blocks.add(text);
+      }
+      if (blocks.length >= 120) break;
+    }
+
+    // Якщо структурованих тегів не знайдено — беремо загальний очищений текст тіла сторінки
+    if (blocks.isEmpty) {
+      final bodyCleaned = html.replaceAll(
+        RegExp(
+          r'<(script|style|head|svg|noscript)[\s\S]*?<\/\1>',
+          caseSensitive: false,
+        ),
+        ' ',
+      );
+      final plain = _stripTags(bodyCleaned);
+      if (plain.isNotEmpty) {
+        blocks.add(plain);
+      }
+    }
+
+    // 5. Витягуємо посилання <a href="...">...</a>
+    final links = <({String text, String url})>[];
+    final seenUrls = <String>{};
+    final linkRegex = RegExp(
+      r'''<a\s+[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>''',
+      caseSensitive: false,
+    );
+    for (final match in linkRegex.allMatches(sanitized)) {
+      final rawHref = decodeHtmlEntities(match.group(1) ?? '').trim();
+      if (rawHref.isEmpty ||
+          rawHref.toLowerCase().startsWith('javascript:') ||
+          rawHref.toLowerCase().startsWith('vbscript:') ||
+          rawHref.toLowerCase().startsWith('data:')) {
+        continue;
+      }
+      final resolvedUri = baseUri.resolve(rawHref);
+      if (resolvedUri.scheme != 'http' && resolvedUri.scheme != 'https') {
+        continue;
+      }
+      final resolvedStr = resolvedUri.toString();
+      if (seenUrls.add(resolvedStr)) {
+        final anchorText = _stripTags(match.group(2) ?? '');
+        links.add((
+          text: anchorText.isNotEmpty ? anchorText : resolvedStr,
+          url: resolvedStr,
+        ));
+        if (links.length >= 80) break;
+      }
+    }
+
+    return (
+      title: title,
+      description: description,
+      blocks: blocks,
+      links: links,
+    );
   }
 }
 
@@ -457,6 +779,39 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     return null;
   }
 
+  /// Перевіряє, чи рядок є веб-посиланням, або містить URL.
+  String? _extractHttpUrl(String text) {
+    final trimmed = text.trim();
+    final lower = trimmed.toLowerCase();
+    if (lower.startsWith('http://') || lower.startsWith('https://')) {
+      return trimmed;
+    }
+    final match = RegExp(
+      r'https?:\/\/[^\s;,"<>]+',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    return match?.group(0);
+  }
+
+  /// Відкриває вбудований безпечний переглядач сторінок для [url].
+  void _openSafeWebViewer(String url) {
+    var normalized = url.trim();
+    if (normalized.isEmpty) {
+      _showSnackBar('Введіть адресу сайту (URL)');
+      return;
+    }
+    final lower = normalized.toLowerCase();
+    if (!lower.startsWith('http://') && !lower.startsWith('https://')) {
+      normalized = 'https://$normalized';
+    }
+
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => SafeWebViewerPage(initialUrl: normalized),
+      ),
+    );
+  }
+
   void _clearCurrentInputs() {
     setState(() {
       switch (_selectedType) {
@@ -621,6 +976,8 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     String scannedData, {
     bool wasDecrypted = false,
   }) {
+    final detectedUrl = _extractHttpUrl(scannedData);
+
     showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -639,7 +996,24 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
             ),
           ],
         ),
-        content: SelectableText(scannedData),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            SelectableText(scannedData),
+            if (detectedUrl != null) ...[
+              const SizedBox(height: 16),
+              FilledButton.tonalIcon(
+                onPressed: () {
+                  Navigator.of(dialogContext).pop();
+                  _openSafeWebViewer(detectedUrl);
+                },
+                icon: const Icon(Icons.shield_outlined),
+                label: const Text('Безпечний перегляд сторінки'),
+              ),
+            ],
+          ],
+        ),
         actions: [
           TextButton.icon(
             onPressed: () {
@@ -1100,10 +1474,15 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
         return TextField(
           controller: _urlController,
           keyboardType: TextInputType.url,
-          decoration: const InputDecoration(
+          decoration: InputDecoration(
             labelText: 'Адреса сайту (URL)',
             hintText: 'https://example.com',
-            prefixIcon: Icon(Icons.language_rounded),
+            prefixIcon: const Icon(Icons.language_rounded),
+            suffixIcon: IconButton(
+              onPressed: () => _openSafeWebViewer(_urlController.text),
+              tooltip: 'Перевірити та відкрити у безпечному переглядачі',
+              icon: const Icon(Icons.shield_outlined),
+            ),
           ),
         );
 
@@ -1532,6 +1911,10 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
     final isCurrentlyEncrypted =
         _generatedQrData != null &&
         QrCryptoHelper.isEncrypted(_generatedQrData!);
+    final detectedUrl =
+        (!isCurrentlyEncrypted && _generatedQrData != null)
+            ? _extractHttpUrl(_generatedQrData!)
+            : null;
 
     if (_isDesktop) {
       return Wrap(
@@ -1550,11 +1933,12 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
                 : const Icon(Icons.folder_open_rounded),
             label: const Text('Зберегти у вибрану теку'),
           ),
-          OutlinedButton.icon(
-            onPressed: _copyGeneratedData,
-            icon: const Icon(Icons.copy_rounded, size: 18),
-            label: const Text('Копіювати дані'),
-          ),
+          if (detectedUrl != null)
+            OutlinedButton.icon(
+              onPressed: () => _openSafeWebViewer(detectedUrl),
+              icon: const Icon(Icons.shield_outlined, size: 18),
+              label: const Text('Безпечний перегляд'),
+            ),
           if (isCurrentlyEncrypted)
             OutlinedButton.icon(
               onPressed: () =>
@@ -1562,6 +1946,11 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
               icon: const Icon(Icons.lock_open_rounded, size: 18),
               label: const Text('Розшифрувати'),
             ),
+          OutlinedButton.icon(
+            onPressed: _copyGeneratedData,
+            icon: const Icon(Icons.copy_rounded, size: 18),
+            label: const Text('Копіювати дані'),
+          ),
         ],
       );
     }
@@ -1581,6 +1970,12 @@ class _QrGeneratorPageState extends State<QrGeneratorPage> {
           icon: const Icon(Icons.folder_open_rounded),
           label: const Text('У теку'),
         ),
+        if (detectedUrl != null)
+          OutlinedButton.icon(
+            onPressed: () => _openSafeWebViewer(detectedUrl),
+            icon: const Icon(Icons.shield_outlined, size: 18),
+            label: const Text('Безпечний перегляд'),
+          ),
         if (isCurrentlyEncrypted)
           OutlinedButton.icon(
             onPressed: () =>
@@ -2025,7 +2420,7 @@ class _DecryptQrDialogState extends State<_DecryptQrDialog> {
                 suffixIcon: IconButton(
                   onPressed: () {
                     setState(() {
-                      _obscurePassword = !(_obscurePassword);
+                      _obscurePassword = !_obscurePassword;
                     });
                   },
                   icon: Icon(
@@ -2050,6 +2445,694 @@ class _DecryptQrDialogState extends State<_DecryptQrDialog> {
           label: const Text('Розшифрувати'),
         ),
       ],
+    );
+  }
+}
+
+/// Вбудований безпечний переглядач веб-сторінок (Safe Reader & Security Inspector).
+/// Завантажує сторінку у контрольованій пісочниці без виконання JavaScript,
+/// відстежує приховані редиректи, перевіряє SSL-сертифікат та фішингові ознаки.
+class SafeWebViewerPage extends StatefulWidget {
+  final String initialUrl;
+
+  const SafeWebViewerPage({super.key, required this.initialUrl});
+
+  @override
+  State<SafeWebViewerPage> createState() => _SafeWebViewerPageState();
+}
+
+class _SafeWebViewerPageState extends State<SafeWebViewerPage> {
+  late final TextEditingController _urlBarController;
+  final List<String> _history = [];
+  bool _isLoading = false;
+  String? _errorMessage;
+  SafePageAnalysis? _analysis;
+  int _selectedTab = 0; // 0 = Читання, 1 = Посилання, 2 = Технічні дані
+
+  @override
+  void initState() {
+    super.initState();
+    _urlBarController = TextEditingController(text: widget.initialUrl);
+    _loadUrl(widget.initialUrl);
+  }
+
+  @override
+  void dispose() {
+    _urlBarController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadUrl(String rawUrl, {bool addToHistory = true}) async {
+    var target = rawUrl.trim();
+    if (target.isEmpty) return;
+    if (!target.toLowerCase().startsWith('http://') &&
+        !target.toLowerCase().startsWith('https://')) {
+      target = 'https://$target';
+    }
+
+    final initialUri = Uri.tryParse(target);
+    if (initialUri == null || initialUri.host.isEmpty) {
+      setState(() {
+        _errorMessage = 'Некоректний формат веб-адреси: $target';
+        _isLoading = false;
+      });
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+      _urlBarController.text = target;
+    });
+
+    if (addToHistory && (_history.isEmpty || _history.last != target)) {
+      _history.add(target);
+    }
+
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10)
+      ..userAgent = 'SafeQrReader/1.0 (Flutter Security Sandbox; No-JS)';
+
+    try {
+      final redirectChain = <String>[initialUri.toString()];
+      var currentUri = initialUri;
+      HttpClientResponse? response;
+
+      for (int hop = 0; hop < 6; hop++) {
+        final request = await client
+            .getUrl(currentUri)
+            .timeout(const Duration(seconds: 10));
+        request.followRedirects = false;
+        request.headers.set(
+          HttpHeaders.acceptHeader,
+          'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5',
+        );
+
+        final res = await request.close().timeout(const Duration(seconds: 10));
+        if (res.isRedirect && res.headers.value(HttpHeaders.locationHeader) != null) {
+          final loc = res.headers.value(HttpHeaders.locationHeader)!;
+          await res.drain<void>();
+          currentUri = currentUri.resolve(loc);
+          redirectChain.add(currentUri.toString());
+          continue;
+        }
+        response = res;
+        break;
+      }
+
+      if (response == null) {
+        throw Exception('Забагато перенаправлень (понад 6 редиректів поспіль)');
+      }
+
+      final contentType =
+          response.headers.contentType?.toString() ?? 'невідомо';
+      final mime = response.headers.contentType?.mimeType.toLowerCase() ?? '';
+
+      final headersMap = <String, String>{};
+      response.headers.forEach((name, values) {
+        headersMap[name] = values.join(', ');
+      });
+
+      final cert = response.certificate;
+      final securityEval = SafeWebInspector.evaluateUriSecurity(
+        currentUri,
+        redirectChain: redirectChain,
+      );
+      final securityNotes = List<String>.from(securityEval.notes);
+      var riskLevel = securityEval.level;
+
+      // Перевіряємо тип вмісту: чи не намагається сторінка завантажити бінарний файл
+      final isTextContent =
+          mime.isEmpty ||
+          mime.startsWith('text/') ||
+          mime.contains('html') ||
+          mime.contains('json') ||
+          mime.contains('xml') ||
+          mime.contains('javascript');
+
+      if (!isTextContent) {
+        securityNotes.add(
+          'Завантаження зупинено пісочницею: сервер повернув нетекстовий файл ($contentType). У безпечному режимі автоматичне скачування файлів заблоковано.',
+        );
+        if (riskLevel == UrlRiskLevel.safe) {
+          riskLevel = UrlRiskLevel.warning;
+        }
+
+        await response.drain<void>();
+        if (!mounted) return;
+        setState(() {
+          _analysis = SafePageAnalysis(
+            originalUrl: initialUri.toString(),
+            finalUrl: currentUri.toString(),
+            redirectChain: redirectChain,
+            riskLevel: riskLevel,
+            securityNotes: securityNotes,
+            statusCode: response!.statusCode,
+            contentType: contentType,
+            pageTitle: currentUri.host,
+            metaDescription: '',
+            textBlocks: [
+              'Сервер повернув бінарний або медіа-ресурс ($contentType). Заради вашої безпеки автоматичне завантаження файлів вимкнено.',
+            ],
+            links: const [],
+            rawSource: '',
+            responseHeaders: headersMap,
+            certIssuer: cert?.issuer,
+            certSubject: cert?.subject,
+            certValidUntil: cert?.endValidity,
+          );
+          _urlBarController.text = currentUri.toString();
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // Читаємо максимум 512 КБ текстових даних
+      const maxBytes = 512 * 1024;
+      final bytesBuilder = BytesBuilder(copy: false);
+      await for (final chunk in response) {
+        if (bytesBuilder.length + chunk.length > maxBytes) {
+          final remaining = maxBytes - bytesBuilder.length;
+          if (remaining > 0) {
+            bytesBuilder.add(chunk.sublist(0, remaining));
+          }
+          break;
+        }
+        bytesBuilder.add(chunk);
+      }
+
+      final rawBytes = bytesBuilder.takeBytes();
+      final bodyText = utf8.decode(rawBytes, allowMalformed: true);
+      final parsed = SafeWebInspector.parseHtmlForSafeReading(
+        bodyText,
+        currentUri,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _analysis = SafePageAnalysis(
+          originalUrl: initialUri.toString(),
+          finalUrl: currentUri.toString(),
+          redirectChain: redirectChain,
+          riskLevel: riskLevel,
+          securityNotes: securityNotes,
+          statusCode: response!.statusCode,
+          contentType: contentType,
+          pageTitle: parsed.title.isNotEmpty ? parsed.title : currentUri.host,
+          metaDescription: parsed.description,
+          textBlocks: parsed.blocks,
+          links: parsed.links,
+          rawSource: bodyText.length > 20000
+              ? '${bodyText.substring(0, 20000)}\n\n... [скорочено]'
+              : bodyText,
+          responseHeaders: headersMap,
+          certIssuer: cert?.issuer,
+          certSubject: cert?.subject,
+          certValidUntil: cert?.endValidity,
+        );
+        _urlBarController.text = currentUri.toString();
+        _isLoading = false;
+      });
+    } catch (e) {
+      // Навіть якщо сервер недоступний — все одно показуємо евристичний звіт безпеки самої адреси
+      final fallbackEval = SafeWebInspector.evaluateUriSecurity(initialUri);
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = 'Не вдалося завантажити сторінку: $e';
+        _analysis = SafePageAnalysis(
+          originalUrl: initialUri.toString(),
+          finalUrl: initialUri.toString(),
+          redirectChain: [initialUri.toString()],
+          riskLevel: fallbackEval.level,
+          securityNotes: fallbackEval.notes,
+          statusCode: null,
+          contentType: 'недоступно',
+          pageTitle: initialUri.host,
+          metaDescription: '',
+          textBlocks: const [],
+          links: const [],
+          rawSource: '',
+          responseHeaders: const {},
+        );
+        _isLoading = false;
+      });
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  void _goBackInHistory() {
+    if (_history.length <= 1) return;
+    _history.removeLast();
+    final previous = _history.last;
+    _loadUrl(previous, addToHistory: false);
+  }
+
+  Widget _buildSecurityBanner(SafePageAnalysis analysis, ColorScheme scheme) {
+    final risk = analysis.riskLevel;
+    return Card(
+      color: risk.color.withAlpha(22),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: risk.color.withAlpha(120), width: 1.5),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(risk.icon, color: risk.color, size: 24),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Аналіз безпеки: ${risk.label}',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 15,
+                      color: risk.color,
+                    ),
+                  ),
+                ),
+                if (analysis.statusCode != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: scheme.surfaceContainerHighest,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      'HTTP ${analysis.statusCode}',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Пісочниця активна: JavaScript, сторонні трекери, cookies та автозавантаження файлів заблоковано.',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 8),
+            ...analysis.securityNotes.map(
+              (note) => Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('• ', style: TextStyle(fontWeight: FontWeight.bold)),
+                    Expanded(
+                      child: Text(note, style: const TextStyle(fontSize: 12.5)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (analysis.redirectChain.length > 1) ...[
+              const Divider(height: 18),
+              const Text(
+                'Ланцюжок перенаправлень (редиректів):',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 4),
+              ...analysis.redirectChain.asMap().entries.map(
+                (entry) => Text(
+                  '${entry.key + 1}. ${entry.value}',
+                  style: const TextStyle(fontSize: 11.5, fontFamily: 'monospace'),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildReaderTab(SafePageAnalysis analysis, ColorScheme scheme) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _buildSecurityBanner(analysis, scheme),
+        if (_errorMessage != null) ...[
+          const SizedBox(height: 12),
+          Card(
+            color: scheme.errorContainer,
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Text(
+                _errorMessage!,
+                style: TextStyle(color: scheme.onErrorContainer, fontSize: 13),
+              ),
+            ),
+          ),
+        ],
+        const SizedBox(height: 14),
+        Card(
+          color: scheme.surfaceContainerLow,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  analysis.pageTitle,
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                SelectableText(
+                  analysis.finalUrl,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: scheme.primary,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+                if (analysis.metaDescription.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: scheme.surfaceContainerHighest.withAlpha(100),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      analysis.metaDescription,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ),
+                ],
+                const Divider(height: 24),
+                if (analysis.textBlocks.isEmpty)
+                  Text(
+                    'Текстовий вміст сторінки порожній або сторінка потребує клієнтського рендерингу.',
+                    style: TextStyle(color: scheme.onSurfaceVariant),
+                  )
+                else
+                  ...analysis.textBlocks.map((block) {
+                    if (block.startsWith('## ')) {
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 14, bottom: 6),
+                        child: SelectableText(
+                          block.substring(3),
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      );
+                    }
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: SelectableText(
+                        block,
+                        style: const TextStyle(fontSize: 14, height: 1.45),
+                      ),
+                    );
+                  }),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLinksTab(SafePageAnalysis analysis, ColorScheme scheme) {
+    if (analysis.links.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('На сторінці не знайдено зовнішніх або внутрішніх посилань.'),
+        ),
+      );
+    }
+
+    return ListView.separated(
+      padding: const EdgeInsets.all(16),
+      itemCount: analysis.links.length,
+      separatorBuilder: (_, _) => const SizedBox(height: 8),
+      itemBuilder: (context, index) {
+        final item = analysis.links[index];
+        return Card(
+          color: scheme.surfaceContainerLow,
+          child: ListTile(
+            leading: Icon(Icons.link_rounded, color: scheme.primary),
+            title: Text(
+              item.text,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+            ),
+            subtitle: Text(
+              item.url,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+            ),
+            trailing: IconButton(
+              icon: const Icon(Icons.copy_rounded, size: 18),
+              tooltip: 'Скопіювати посилання',
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: item.url));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Посилання скопійовано'),
+                    behavior: SnackBarBehavior.floating,
+                  ),
+                );
+              },
+            ),
+            onTap: () {
+              setState(() => _selectedTab = 0);
+              _loadUrl(item.url);
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildTechnicalTab(SafePageAnalysis analysis, ColorScheme scheme) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        if (analysis.certSubject != null || analysis.certIssuer != null)
+          Card(
+            color: scheme.surfaceContainerLow,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'SSL / TLS сертифікат сервера:',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  if (analysis.certSubject != null)
+                    Text('Суб’єкт: ${analysis.certSubject}', style: const TextStyle(fontSize: 12.5)),
+                  if (analysis.certIssuer != null)
+                    Text('Видавець: ${analysis.certIssuer}', style: const TextStyle(fontSize: 12.5)),
+                  if (analysis.certValidUntil != null)
+                    Text('Дійсний до: ${analysis.certValidUntil}', style: const TextStyle(fontSize: 12.5)),
+                ],
+              ),
+            ),
+          ),
+        const SizedBox(height: 12),
+        Card(
+          color: scheme.surfaceContainerLow,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'HTTP-заголовки відповіді:',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                if (analysis.responseHeaders.isEmpty)
+                  const Text('Немає даних заголовків')
+                else
+                  ...analysis.responseHeaders.entries.map(
+                    (e) => Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: SelectableText(
+                        '${e.key}: ${e.value}',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          color: scheme.surfaceContainerLow,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Вихідний код сторінки (HTML):',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                SelectableText(
+                  analysis.rawSource.isNotEmpty
+                      ? analysis.rawSource
+                      : 'Вихідний код відсутній',
+                  style: const TextStyle(fontSize: 11.5, fontFamily: 'monospace'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final analysis = _analysis;
+
+    return Scaffold(
+      appBar: AppBar(
+        titleSpacing: 8,
+        title: const Row(
+          children: [
+            Icon(Icons.shield_outlined, size: 20),
+            SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                'Безпечний переглядач',
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          if (_history.length > 1)
+            IconButton(
+              onPressed: _isLoading ? null : _goBackInHistory,
+              tooltip: 'Попередня сторінка',
+              icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 18),
+            ),
+          IconButton(
+            onPressed: _isLoading
+                ? null
+                : () => _loadUrl(_urlBarController.text, addToHistory: false),
+            tooltip: 'Оновити',
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+          IconButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: _urlBarController.text));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Адресу скопійовано в буфер обміну'),
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+            },
+            tooltip: 'Скопіювати URL',
+            icon: const Icon(Icons.copy_rounded, size: 19),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _urlBarController,
+                    keyboardType: TextInputType.url,
+                    onSubmitted: (val) => _loadUrl(val),
+                    decoration: const InputDecoration(
+                      hintText: 'https://...',
+                      prefixIcon: Icon(Icons.public_rounded, size: 20),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: _isLoading
+                      ? null
+                      : () => _loadUrl(_urlBarController.text),
+                  child: const Text('Перейти'),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: SegmentedButton<int>(
+              showSelectedIcon: false,
+              segments: [
+                const ButtonSegment(
+                  value: 0,
+                  icon: Icon(Icons.article_outlined, size: 18),
+                  label: Text('Читання'),
+                ),
+                ButtonSegment(
+                  value: 1,
+                  icon: const Icon(Icons.link_rounded, size: 18),
+                  label: Text(
+                    'Посилання${analysis != null ? ' (${analysis.links.length})' : ''}',
+                  ),
+                ),
+                const ButtonSegment(
+                  value: 2,
+                  icon: Icon(Icons.code_rounded, size: 18),
+                  label: Text('Код і SSL'),
+                ),
+              ],
+              selected: {_selectedTab},
+              onSelectionChanged: (selection) {
+                setState(() => _selectedTab = selection.first);
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          if (_isLoading) const LinearProgressIndicator(),
+          Expanded(
+            child: analysis == null
+                ? const Center(child: CircularProgressIndicator())
+                : IndexedStack(
+                    index: _selectedTab,
+                    children: [
+                      _buildReaderTab(analysis, scheme),
+                      _buildLinksTab(analysis, scheme),
+                      _buildTechnicalTab(analysis, scheme),
+                    ],
+                  ),
+          ),
+        ],
+      ),
     );
   }
 }
